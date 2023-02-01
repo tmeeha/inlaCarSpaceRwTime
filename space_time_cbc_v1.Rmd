@@ -1,0 +1,648 @@
+---
+title: A spatiotemporal interaction model for analysis of long-term, large-extent, wildlife abundance data
+author: "Timothy D. Meehan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, message=FALSE, warning=FALSE, error=FALSE, cache = T)
+```
+
+## 1. Background and motivation
+
+This document examines a spatiotemporal interaction model for analyzing relative abundance data from regional-, national-, or continental-scaled wildlife monitoring programs. The approach is a variation on those developed for the North American Breeding Bird Survey (Link and Sauer 2002, Sauer and Link 2011, Bled et al. 2013, Link et al. 2017, Smith and Edwards 2021) and the Audubon Christmas Bird Count (Link et al. 2006, Soykan et al. 2016, Meehan et al. 2019).
+
+Motivation for exploring a spatiotemporal interaction model comes from recent work showing the value of including spatially structured model terms (Bled et al. 2013, Meehan et al. 2019) and of modeling temporal effects in a more flexible manner (Link et al. 2017, Smith and Edwards 2020) relative to the standard model originally described in Link and Sauer (2002). An additional motivation was to demonstrate implementing BBS and CBC models with integrated, nested, Laplace approximation (INLA) using the `R-INLA` package (Rue et al. 2017) for `R` statistical computing software (R Core Team). Analysis of Bayesian spatiotemporal models using `R-INLA` is attractive because tools for building spatiotemporal models are well developed, and computing times are a small fraction of those needed for MCMC analysis. Reduced computing times is not just an issue of convenience, as it facilitates running more models and multimodel selection (Link et al. 2017, 2020). Also, cross-validation based model selection criteria already used for selection of BBS models are easily derivable from INLA output (Held et al. 2010).
+
+In this document, we demonstrate model implementation using counts of Carolina Wren (*Thryothorus ludovicianus*) from both the BBS and the CBC. The species was chosen because it is a year-round resident of southeastern North America, with relatively minor movements across seasons, facilitating comparison of relative abundance patterns generated using data from these two different programs (Link and Sauer 2007). The species range occupies approximately one-quarter of North America, so model computing times (~10 minutes) are representative of those for many species monitored by these programs. 
+
+The models explored here are, at their core, space-time interaction models. The same spatiotemporal model components are used for both BBS and CBC models. The general strategy of the analysis is to create a spatial surface of relative abundance (abundance indices) across the species range for each year in the dataset (Bled et al. 2013, Michel et al. 2019). Once these abundance index surfaces are produced, it is possible to use annual estimates at a given location to produce a local or aggregated time series of abundance indices (relative abundance trajectory), and then to calculate relative abundance trends from those trajectories (Bled et al. 2013, Michel et al. 2019). 
+
+The spatial units modeled here are the analysis strata typically used for BBS and CBC models. These strata are intersections of borders of US states, Canadian provinces, and established Bird Conservation Regions (Sauer et al. 2003). There are several reasons for choosing these spatial units. From a wildlife and management perspective, they reflect natural groupings of biomes and management boundaries. From a statistical perspective, they are large enough to pool several count sites, regardless of program, which potentially increases the robustness and decreases uncertainty in local estimates. For example, across the modeled range of Carolina Wren, the number of BBS routes per stratum ranges from 3 to 95 and averages 22. From a practical perspective, analytical strata are currently the standard spatial unit of analysis (Sauer and Link 2011, Soykan et al. 2016), so using them facilitates methodological comparisons. The methods here could also be applied to smaller, uniform grids, like those used for finer-grained analyses demonstrated by Bled et al. (2013) and Meehan et al. (2019). Using finer grids facilitates fine-scaled analysis of drivers of relative abundance trajectories, but also has tradeoffs, and they are not employed here.
+
+The approach described here uses a spatiotemporal model developed and widely used in epidemiology (Knorr-Held 2000). The spatiotemporal component has exchangeable and ICAR-structured (intrinsic conditional autoregressive) spatial main effects, and exchangeable and RW1-structured (first-order random walk) temporal main effects. The model also includes a type IV space-time interaction where ICAR structure evolves over time according to an RW1. The mathematics of the model are described by Knorr-Held (2000) and implementation in `R-INLA` is described by Blangiardo and Cameletti (2015). Besides the spatiotemporal components, the linear predictor also includes fixed and random terms that are associated with nuisance variables related to the counting process. These terms vary across the BBS and CBC and are described below.
+
+In the following sections we walk through the nearly complete process of loading data, preparing data for analysis in `R-INLA`, defining and computing models, viewing model output and diagnostics, producing visuals of model predictions, and comparing model predictions to those from other models currently in use.
+
+## 2. Setting up the analysis
+
+The first step is to set up the computing environment for analysis by setting a working directory and loading libraries. The libraries include `dplyr`, `tidyr`, and `tidybayes` for data munging; `R-INLA`, `brinla`, `inlatools`, and `spdep` for model building;  `sf` and `bbsBayes` for mapping, and `ggplot2` and `cowplot` for creating figures. We also set some options and create some helper functions for extracting model scores and predictions from `R-INLA` objects.
+
+```{r start, eval=TRUE, cache=TRUE}
+setwd(getwd())
+
+# libraries
+library(ggplot2); library(cowplot); library(bbsBayes); library(tidybayes)
+library(coda); library(spdep); library(brinla); library(inlatools); 
+library(sf); library(INLA); library(tidyr); library(dplyr)
+
+# options
+inla.setOption(inla.mode="experimental")
+options(scipen=9999999)
+options(max.print=99999)
+options(stringsAsFactors=FALSE)
+
+# helper for getting model scores
+get_bpic <- function(mod=res1, pred_idx=pred_idx1){
+  require(INLA)
+  cpo_vec <- mod$gcpo$gcpo[-pred_idx]
+  nas <- which(is.na(cpo_vec))
+  if(any(is.na(cpo_vec))) 
+    warning(paste("Some CPO values are NA. BPIC may not be", 
+                  "reliable for model comparison.")) 
+  out1 <- as.numeric(-2*sum(log(cpo_vec), na.rm=TRUE))
+  out2 <- as.numeric(mean(log(cpo_vec), na.rm=TRUE))
+  out3 <- as.integer(nas)
+  out <- list(`-2*sum(log(cpo_vec), na.rm=TRUE)`=out1,
+              `mean(log(cpo_vec), na.rm=TRUE)`=out2,
+              `number_na`=length(out3),
+              `na_indices`=out3)
+  return(out)
+}
+
+# helper for getting model predictions
+get_prediction_samples <- function(mod_obj=res1, post_samp_size=1000,
+                                   pred_idx=pred_idx1, pred_data=bbs3,
+                                   pred_id_cols=c("strat_name", "r_year"),
+                                   out_form=c("mcmc_list", "tidy_tibble")
+                                   ){
+  require(coda); require(tidyr); library(tidybayes); require(INLA); 
+  require(dplyr)
+  s1 <- INLA::inla.posterior.sample(post_samp_size, mod_obj)
+  s2 <- INLA::inla.posterior.sample.eval("Predictor", s1)[pred_idx,] 
+  s2 <- t(exp(s2))
+  ids1 <- pred_data %>% dplyr::slice(pred_idx) %>% 
+    dplyr::select(pred_id_cols)  
+  colnames(s2) <- paste0("index[", paste(ids1$strat_name, 
+                                                ids1$r_year, sep=","), "]")
+  s3 <- as.mcmc.list(mcmc(s2))
+  if(out_form=="tidy_tibble"){
+    s3 <- spread_draws(s3, index[strat_name, r_year])
+  }
+  return(s3)
+}
+```
+
+## 3. Spatiotemporal analysis for BBS data
+
+### 3.1 Format BBS data
+
+With the computing environment ready to go, we import some BBS data from a flat file.  The file was originally created using the `bbsBayes` package, which presumably conducts site selection and zero filling as appropriate. Some additional columns were created for random effect indices that will be used by `R-INLA`. The imported data has 49,030 records comprising individual counts of Carolina Wren by 354 observers in 85 strata over 50 years. Eventually we will make predictions from the model derived from these data. An easy way to create predictions using `R-INLA` is to add rows to the data, where specific covariate values are given but the response is given as NA. For these analyses, we would like to get a prediction for the expected count for each year (annual abundance indices) for each analytical stratum. Thus we add a row to the data for each year and stratum, specify the covariate values for the nuisance covariates, and give NA values for the response. We will explain the nuisance covariates and their prediction values in more detail below. While adding the prediction rows, we keep track of row numbers for extracting predictions after model computation.
+
+```{r get data, eval=TRUE, cache=TRUE}
+# load data
+bbs2 <- read.csv("bbs_data.csv")
+
+# add prediction rows per stratum and year
+bbs3 <- bbs2 %>% mutate(count=NA, firstyr=0, obser_idx1=NA, 
+                        obser_route_idx1=NA, row_idx1=NA) %>% 
+  distinct(strat_idx1, year_idx1, .keep_all=TRUE)
+bbs3 <- rbind(bbs2, bbs3)
+pred_idx1 <- (nrow(bbs2)+1):nrow(bbs3)
+```
+
+### 3.2 Make a map and neighborhood structures
+
+To build a spatiotemporal model, we need information on spatial relationships between the modeled objects: here, the analytical strata. To do this we first create a polygon map of the strata and then build structures that describe the neighbors of each stratum. First we build a map key that lists the strata in the BBS dataset.  Then we import a polygon map file from the `bbsBayes` package and join it with the map key. Then we compute the number of BBS routes per stratum and view the stratum map. After that, we make a neighborhood matrix from the map using the `spdep` package and convert that matrix to an `R-INLA` graph object.
+
+```{r make map, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# make map
+m_key <- bbs3 %>% select(strat_name, strat_idx1) %>% distinct()
+map1 <- load_map(stratify_by="bbs_usgs") %>% rename_all(tolower) %>% 
+  select(2, 3) %>% rename(strat_name=st_12, strat_A=area_1) %>% right_join(m_key) %>% 
+  select(1,2,3)
+routes_per_stratum <- bbs2 %>% distinct(strat_name, route_idx1) %>% 
+  group_by(strat_name) %>% 
+  summarise(n_bbs_routes=n()) %>% 
+  left_join(map1, by=as.character("strat_name")) %>% 
+  st_as_sf()
+ggplot(data=routes_per_stratum) + geom_sf(aes(fill=n_bbs_routes)) + 
+  theme_bw() + scale_fill_distiller("count of\nBBS routes", palette="Spectral")
+
+# make neighborhood matrix and graph for R-INLA
+nb1 <- poly2nb(as(map1, "Spatial"))
+nb2INLA("map.adj", nb1)
+g1 <- inla.read.graph(filename = "map.adj")
+```
+
+### 3.3 Formula for the BBS spatiotemporal model
+
+With spatial relationships between strata established, we move to the model formula. `R-INLA` model formula syntax is similar to that of other `R` packages commonly used for analyzing mixed-effect models. On the left side of the tilde is the response to be modeled. On the right side are the fixed and random effects. For our spatiotemporal BBS model, we specify count as the response and specify a global fixed intercept with a 1. It's been shown that the experience level of BBS observers has an effect on counts, so we add a global fixed effect of a binary variable that indicates an observer's first year (Sauer and Link 2011). Random effects are added to `R-INLA` models using the `f()` notation. The first random effect is a random intercept where the index for the effect (`obser_route_idx1`) comprises a series of integers from 1 to 7,041 unique combinations of BBS observer and route. This effect accounts for differences in counts related to the abilities of different observers and environmental characteristics of different routes, and is defined as exchangeable and normally distributed (`model="iid"`) and centered on zero (`constr=TRUE`), similar to Bled et al. (2013). 
+
+```{r formula, eval=TRUE, cache=TRUE}
+# priors
+prec_prior <- list(prec = list(prior = "pc.prec", param = c(1, 0.01)))
+bym_prior <- list(prec = list(prior = "pc.prec", param = c(1, 0.01)), 
+                  phi = list(prior = "pc", param = c(0.5, 0.5)))
+
+# make formula for bbs st model
+form <- count ~ 1 + firstyr + 
+  f(obser_route_idx1, model="iid", constr=TRUE, hyper=prec_prior) +
+  f(year_idx1, model="iid", constr=TRUE, hyper=prec_prior) +
+  f(year_idx2, model="rw1", constr=TRUE, scale.model=TRUE, hyper=prec_prior) + 
+  f(strat_idx1, model="bym2", graph=g1, constr=TRUE, scale.model=TRUE, hyper=bym_prior) +
+  f(strat_idx2, model="besag", graph=g1, constr=TRUE, scale.model=TRUE,
+    group=year_idx3, control.group=list(model="rw1", hyper=prec_prior)) 
+```
+
+The second and third random effects are the zero-centered exchangeable (`constr=TRUE`, `model="iid"`) and RW1-structured (`model="rw1"`) temporal main effects indexed over 1 to 50 years (`year_idx1`, `year_idx2`). The fourth random term specifies the Besag-York-Mollie model (`model="bym2"`, BYM, Besag et al. 1991) modified by Riebler et al. (2016), which comprises both a zero-centered exchangeable and ICAR-structured spatial main effect indexed over 1 to 85 strata (`strat_idx1`). The fifth random effect is the space-time interaction term, a zero-centered, ICAR-structured (`model="besag"`), spatial effect (`strat_idx2`) that evolves over time (`year_idx3`) as an RW1. The `R-INLA` graph object (`graph=g1`) describes the spatial relationships between the strata. The priors used for the standard deviation of random effects are penalized-complexity (PC) priors, set such that the probability of a random effect exceeding 1 SD is 0.01 (Simpson et al. 2017). The prior for the proportion variance explained by the spatially structured effect in the BYM model is set such that the probability of a proportion exceeding 0.5 is 0.5 (Riebler et al. 2016). Priors for fixed effects are vague normal priors with mean of 0 and precision of 0 for the intercept and 0.001 otherwise. Note that predicted abundance indices from this model will be generated assuming an experienced observer and ignoring the zero-centered observer-route effect. This was specified above when generating the prediction rows in the dataset using `firstyr=0` and `obser_route_idx1=NA`. Adding variance components to rescale predicted abundance indices (Sauer and Link 2011) is not done here given their relative interpretation.
+
+### 3.4 Run the BBS spatiotemporal model
+
+After defining the model in `R-INLA` syntax, we compute the model and predictions with a call to the `inla()` function. In the `inla()` call, we specify the negative binomial distribution. We use the negative binomial distribution (Poisson-gamma mixture) rather than an observation-level random effect (Poisson-lognormal mixture) to deal with overdispersed counts because the two approaches yield similar results, but using the negative binomial is more computationally efficient.
+
+```{r run model, eval=TRUE, cache=TRUE}
+# run bbs st model
+res1 <- inla(form, data=bbs3,
+            family = "nbinomial", 
+            control.predictor=list(compute=TRUE, link=1),
+            control.compute=list(config=TRUE, waic=TRUE, cpo=TRUE,
+                                 control.gcpo=list(enable=TRUE)),
+            verbose=TRUE, inla.mode="experimental",
+            control.inla = list(strategy = 'adaptive', int.strategy = 'eb'))
+```
+
+The `inla()` call also has arguments requesting predictions (`compute=TRUE`), WAIC values (`waic=TRUE`), and conditional predictive ordinate values (`cpo=TRUE` and `control.gcpo=list(enable=TRUE)`). Finally, we use the adaptive integration strategy and the Empirical Bayes estimation procedure to speed up processing for development and demonstration purposes. Model estimation and prediction were accomplished in approximately 10 minutes on a standard laptop computer.
+
+### 3.5 View model outputs
+
+Modeling counts can be challenging. Creating an omnibus model that fits count data across hundreds of species in a monitoring program is that much more challenging. We never really expect textbook model fits in this situation, but rather look for a model that fits many species fairly well. We evaluate the fit of the spatiotemporal BBS model to the data from four angles. We use the `inlatools` package to look at the dispersion and distribution of the posterior predictive distribution, we inspect a histogram of the cross-validated probability integral transform (PIT) values from the `R-INLA` model output, and view a plot of raw observed counts versus fitted values from the model.    
+
+```{r view diags, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# view diagnostics
+fp1 <- inlatools::dispersion_check(res1) %>% plot() + theme_bw()
+fp2 <- inlatools::fast_distribution_check(res1) %>% plot() + theme_bw()
+fp3 <- ggplot(data.frame(x=res1$cpo$pit[-pred_idx1])) +
+  geom_histogram(aes(x=x), col="white") + theme_bw()
+fp4 <- ggplot(data.frame(predicted=res1$summary.fitted.values$mean, 
+       observed=bbs3$count), aes(x=observed, y=predicted)) + 
+  geom_point() + geom_abline(col="darkblue") + theme_bw() + labs(y="fitted")
+plot_grid(fp1, fp2, fp3, fp4)
+cor(res1$summary.fitted.values$mean, bbs3$count, use="complete.obs")
+```
+
+The first diagnostic plot shows that overdispersion was well handled by the negative binomial distribution and that the predictive distribution from the model now is somewhat underdispersed. The second diagnostic shows that the model slightly underestimates the number of near-zero values and slightly overestimates values between 10 and 25. However these deviations from expectations are generally less than 5%, which is acceptable. Ideally, a well fitted model yields PIT values with a uniform distribution (Czado et al. 2009, Held et al. 2010). The distribution of PIT values from this model resembles a uniform distribution, though it is right-skewed, indicating some bias in the central tendency of the predictive distribution. The plot of observed counts versus posterior mean estimated values looks remarkably good. The correlation coefficient between observed and fitted values is 0.95. Overall, model fit is sufficient.
+
+The next bit of code extracts summaries for the model hyperparameters and the fixed effect of an observer's first year. 
+
+```{r view summaries, eval=TRUE, cache=TRUE}
+# view hyperparameter and fixed effect summary
+bri.hyperpar.summary(res1)[-1,c(1,3,5)]
+res1$summary.fixed[,c(1,3,5)]
+```
+
+The hyperparameter summaries show that a fair amount of variation is explained by the observer-route effect. After that the spatiotemporal interaction term explains the most variation, followed by the temporal and spatial main effects, which explain similar amounts. The fixed effect in the model, `firstyr`, has a small but meaningful negative effect on counts.
+
+### 3.6 Extract and view model predictions
+
+Next we have code that extracts model comparison scores, WAIC and BPIC. Code is shown in case it is helpful, but formal model comparisons are not conducted here. We run code to extract predicted values and 95% credible intervals from the model. These predictions are considered abundance indices per stratum and year that ignore zero-centered effects of observer identity and route and assume an experienced observer.
+
+```{r predictions, eval=TRUE, cache=TRUE}
+# model scores
+bpic1 <- get_bpic(res1, pred_idx1); bpic1$`-2*sum(log(cpo_vec), na.rm=TRUE)`
+waic1 <- res1$waic$waic; waic1
+
+# extract predicted abundance indices
+bbs3$st_fit <- exp(res1$summary.linear.predictor$mean)
+bbs3$st_lcl <- exp(res1$summary.linear.predictor$`0.025quant`)
+bbs3$st_ucl <- exp(res1$summary.linear.predictor$`0.975quant`)
+pred1 <- bbs3 %>% slice(pred_idx1) %>% 
+  select(strat_name, r_year, st_fit, st_lcl, st_ucl) %>% 
+  left_join(map1) %>% st_as_sf()
+```
+
+After extracting the predicted values, we join them with the stratum map and plot abundance indices at five year intervals for inspection. We see the spatial and temporal structure in relative abundance, but also note that strong anomalous signals are encountered on occasion due to exchangeable terms in the model (e.g., 1975 and 1985 in South Carolina, and 2005 and 2010 in Kentucky). After mapping the abundance indices, we view full time series for three strata in Pennsylvania.
+
+```{r maps, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# map abundance indices per 5 years
+ggplot() + 
+  geom_sf(data=pred1 %>% 
+            filter(r_year %in% seq(min(r_year), max(r_year), by=5)), 
+          aes(fill = st_fit)) +
+  facet_wrap(~r_year, dir = "h", ncol = 5) +
+  ggtitle("posterior mean BBS abundance index") + theme_bw() +
+  theme(axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()) +
+  scale_fill_distiller("index", palette="Spectral")
+
+# plot trajectories for PA
+ggp1 <- ggplot(pred1 %>% filter(grepl('PA', strat_name)), 
+       aes(x=r_year, y=st_fit, ymin=st_lcl, ymax=st_ucl)) +
+  geom_ribbon(alpha=0.4) +
+  geom_line(col="darkblue") +
+  facet_wrap(~strat_name, scales="free") +
+  labs(x="year", y="predicted BBS abundance index with 95% CrI") +
+  theme_bw(); ggp1
+```
+
+## 4. Spatiotemporal model for CBC data
+
+### 4.1 Data, maps, and neighborhoods 
+
+Next we use the same model to estimate relative abundance trajectories for the same species, across most of the same strata, during a different season, monitored through a different program: the Audubon Christmas Bird Count. Most of the steps are the same as for BBS data, so we will run through them with less explanation. Like before, we load the CBC data, add a row for each stratum and year combination with `NA` values for counts and desired values for covariates for prediction, make a map of the strata in the CBC dataset, and then create necessary neighborhood objects for modeling.
+
+```{r cbc data, eval=TRUE, cache=TRUE}
+# cbc data
+cbc2 <- read.csv("cbc_data.csv")
+
+# add simple prediction data
+cbc3 <- cbc2 %>% mutate(count=NA, log_hrs=mean(cbc2$log_hrs), circ_idx1=NA, row_idx1=NA) %>% 
+  distinct(strat_idx1, year_idx1, .keep_all=TRUE)
+cbc3 <- rbind(cbc2, cbc3)
+pred_idx2 <- (nrow(cbc2)+1):nrow(cbc3)
+
+# make map
+m_key <- cbc3 %>% select(strat_name, strat_idx1) %>% distinct()
+map2 <- load_map(stratify_by="bbs_usgs") %>% rename_all(tolower) %>% 
+  select(2, 3) %>% rename(strat_name=st_12, strat_A=area_1) %>% right_join(m_key) %>% 
+  select(1,2,3)
+
+# make neighbors
+nb2 <- poly2nb(as(map2, "Spatial"))
+nb2INLA("map.adj", nb2)
+g2 <- inla.read.graph(filename = "map.adj")
+```
+
+### 4.2 Define and run the CBC spatiotemporal model
+
+The model for the CBC data is similar to that for BBS data. Like last time, we specify a global intercept, the temporal and spatial main effects, and the space-time interaction term. The zero-centered, exchangeable random intercept per CBC count circle is analogous to the observer-route effect in the BBS model. Finally, CBC is different from BBS in that the effort expended on a count can vary enormously across space and time. Thus we need to control for varying effort, using a measurement of effort called party hours. In past work, we have had good results accounting for effort by adding the natural log of effort to the linear predictor (Meehan et al. 2019). The log of party hours regressed against the log of expected count leads to a flexible power-law effort-correction function that can accommodate linear and accelerating and decelerating nonlinear relationships between the two measures. It is not as flexible as the two parameter power function that is often used for CBC data (Link et al. 2006, Soykan et al. 2016), but we have found that the second power law parameter is seldom needed (parameter estimate $p$ is seldom different from 0), and including it in the model makes model estimation less stable. Previous work has also shown that there is considerable spatial structure in the effort-correction coefficient, where power curves are flatter where species are less abundant and steeper where species are more abundant, which makes sense from a sampling perspective. So here we model the effort-correction function as a global fixed effect paired with a spatially varying (ICAR-structured), zero-centered deviation. Predicted abundance indices ignore the zero-centered circle effect, and assume an average number of party hours, as defined in the prediction rows added to the dataset (`log_hrs=mean(cbc2$log_hrs)`, `circ_idx1=NA`). Priors for all terms were specified as described above for the BBS model. After the model is defined, we run the `inla()` command as before. Again, computing time for this spatiotemporal model was under 10 minutes.
+
+```{r cbc form, eval=TRUE, cache=TRUE}
+# make cbc st formula
+form <- count ~ 1 + log_hrs +
+  f(circ_idx1, model="iid", constr=TRUE, hyper=prec_prior) +
+  f(strat_idx1, log_hrs, model="besag", graph=g2, constr=TRUE, scale.model=TRUE, 
+    hyper=prec_prior) +
+  f(year_idx1, model="iid", constr=TRUE, hyper=prec_prior) +
+  f(year_idx2, model="rw1", constr=TRUE, scale.model=TRUE, hyper=prec_prior) + 
+  f(strat_idx2, model="bym2", graph=g2, constr=TRUE, scale.model=TRUE, hyper=bym_prior) +
+  f(strat_idx3, model="besag", graph=g2, constr=TRUE, scale.model=TRUE,
+    group=year_idx3, control.group=list(model="rw1", hyper=prec_prior)) 
+
+# run model
+res2 <- inla(form, data=cbc3,
+            family = "nbinomial", 
+            control.predictor=list(compute=TRUE, link=1),
+            control.compute=list(config=TRUE, waic=TRUE, cpo=TRUE,
+                                 control.gcpo=list(enable=TRUE)),
+            verbose=TRUE, inla.mode="experimental",
+            control.inla = list(strategy = 'adaptive', int.strategy = 'eb'))
+```
+
+### 4.3 View model outputs
+
+Model diagnostics are similar to those for the BBS model. Overdispersion and underdispersion are taken care of, the model produces slightly biased predictions (generally < 5%) for low values, the PIT histogram is near uniform with a slight right skew, and the fit between observed and expected is overall quite good (r = 0.92).
+
+```{r cbc diags, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# view diagnostics
+fp5 <- inlatools::dispersion_check(res2) %>% plot() + theme_bw()
+fp6 <- inlatools::fast_distribution_check(res2) %>% plot() + theme_bw()
+fp7 <- ggplot(data.frame(x=res2$cpo$pit[-pred_idx2])) +
+  geom_histogram(aes(x=x), col="white") + theme_bw()
+fp8 <- ggplot(data.frame(predicted=res2$summary.fitted.values$mean, 
+       observed=cbc3$count), aes(x=observed, y=predicted)) + 
+  geom_point() + geom_abline(col="darkblue") + theme_bw()
+plot_grid(fp5, fp6, fp7, fp8)
+cor(res2$summary.fitted.values$mean, cbc3$count, use="complete.obs")
+
+# view hyperparameter summary
+bri.hyperpar.summary(res2)[-1,c(1,3,5)]
+res2$summary.fixed[,c(1,3,5)]
+
+# model scores
+bpic2 <- get_bpic(res2, pred_idx2); bpic2$`-2*sum(log(cpo_vec), na.rm=TRUE)`
+waic2 <- res2$waic$waic; waic1
+```
+
+Of the random effects, most variation was explained by circle, followed by the spatiotemporal interaction, followed by the temporal main effects, and then the spatial main effects. Of the spatial main effects, the exchangeable component accounted for much more variation than the structured part. The average coefficient for the power-law effort correction function was 0.74, indicating diminishing returns for increased effort on average.  
+
+### 4.4 Extract and view predictions
+
+Maps produced from predictions from the CBC model show similar relative abundance patterns as those produced by the BBS model, with relative abundance being highest toward the center of the range and lowest at the periphery. Further, the trajectories produced from the CBC model for strata in Pennsylvania look qualitatively similar to those from the BBS model.
+
+```{r cbc preds, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# extract abundance index predictions
+cbc3$st_fit <- exp(res2$summary.linear.predictor$mean)
+cbc3$st_lcl <- exp(res2$summary.linear.predictor$`0.025quant`)
+cbc3$st_ucl <- exp(res2$summary.linear.predictor$`0.975quant`)
+pred2 <- cbc3 %>% slice(pred_idx2) %>% 
+  select(strat_name, r_year, st_fit, st_lcl, st_ucl) %>% 
+  left_join(map1) %>% st_as_sf()
+
+# map abundance indices per 5 years
+ggplot() + 
+  geom_sf(data=pred2 %>% 
+            filter(r_year %in% seq(min(r_year), max(r_year), by=5)), 
+          aes(fill = st_fit)) +
+  facet_wrap(~r_year, dir = "h", ncol = 5) +
+  ggtitle("posterior mean CBC abundance index") + theme_bw() +
+  theme(axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()) +
+  scale_fill_distiller("index", palette="Spectral")
+
+# plot it for PA
+ggp2 <- ggplot(pred2 %>% filter(grepl('PA', strat_name)), 
+       aes(x=r_year, y=st_fit, ymin=st_lcl, ymax=st_ucl)) +
+  geom_ribbon(alpha=0.4) +
+  geom_line(col="darkblue") +
+  facet_wrap(~strat_name, scales="free") +
+  labs(x="year", y="predicted CBC abundance index with 95% CrI") +
+  theme_bw(); ggp2
+```
+
+## 5. Comparing predictions across seasons
+
+The qualitative similarities between the spatiotemporal model outputs using BBS and CBC data are encouraging. Carolina Wren are mostly year-round residents where they occur, so we might expect breeding and winter season trajectories to be somewhat proportional to one another. We do not expect them to be equal to one another due to differences in survey methods and model specifics. To explore their proportionality, we take posterior mean BBS and CBC abundance indices, scale them (subtract mean and divide by SD) per stratum, and plot them on top of one another.
+
+```{r bbs vs cbc, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# scale abundance indices
+scl1 <- pred1 %>% st_drop_geometry() %>% 
+  group_by(strat_name) %>% mutate(sc_fit_bbs=as.numeric(scale(st_fit))) %>% 
+  select(strat_name, r_year, sc_fit_bbs)
+scl2 <- pred2 %>% st_drop_geometry() %>% 
+  group_by(strat_name) %>% mutate(sc_fit_cbc=as.numeric(scale(st_fit))) %>% 
+  select(strat_name, r_year, sc_fit_cbc)
+scaled_idxs <- left_join(scl2, scl1, by = c("strat_name", "r_year"))
+
+# plot scaled bbs and cbc time series together
+scaled_idxs %>% drop_na() %>% 
+  filter(strat_name %in% sample(unique(scaled_idxs$strat_name), 20)) %>% 
+  ggplot() +
+    geom_line(aes(x=r_year, y=sc_fit_bbs), color="darkred") + 
+    geom_line(aes(x=r_year, y=sc_fit_cbc), color="darkblue") + 
+    facet_wrap(~strat_name, scales="free") + theme_bw() +
+  labs(x="year", y="scaled spatiotemporal model BBS (red) and CBC (blue) index")
+cor(scaled_idxs$sc_fit_bbs, scaled_idxs$sc_fit_cbc, use="complete.obs")
+```
+
+When we plot results for a sample of overlapping strata, we see a remarkable match in indices across the two seasons and programs. The correlation coefficient for the association is 0.72.
+
+## 6. Comparing predictions across modeling techniques
+
+### 6.1 Spatiotemporal BBS and GAMYE BBS models
+
+We can also compare the proportionality of abundance indices from the spatiotemporal model to those from other types of models. Here we plot the spatiotemporal trajectories with those provided by Smith and Edwards (2021) who model BBS data using a model with a generalized additive temporal smoother (with an exchangeable effect of year, GAMYE) and no spatial structure. There is a fairly close correspondence between outputs from the two models, with a correlation coefficient of 0.94. 
+
+```{r, bbs vs gamye, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# compare st bbs with bbs gamye model 
+scaled_bbs_gamye <- read.csv("bbs_scaled_gamye.csv") 
+scaled_idxs <- left_join(scaled_idxs, scaled_bbs_gamye)
+
+# plot scaled st bbs and gamye bbs time series together
+scaled_idxs %>% drop_na() %>% 
+  filter(strat_name %in% sample(unique(scaled_idxs$strat_name), 20)) %>% 
+  ggplot() +
+  geom_line(aes(x=r_year, y=sc_fit_bbs), color="darkred") + 
+  geom_line(aes(x=r_year, y=sc_gy_bbs), color="darkblue") + 
+  facet_wrap(~strat_name, scales="free") +
+  labs(x="year", y="scaled spatiotemporal (red) and gamye (blue) model BBS index")
+cor(scaled_idxs$sc_fit_bbs, scaled_idxs$sc_gy_bbs, use="complete.obs")
+```
+
+### 6.2 Spatiotemporal CBC and standard CBC models
+
+The same methodological comparison can be conducted between the CBC spatiotemporal model results and those from the standard CBC analysis, which uses a combined log-linear and exchangeable random effect per year and no spatial structure (Link et al. 2006, Soykan et al. 2016). Again it appears that there is a reasonable correspondence between the two sets of outputs, with a correlation coefficient of 0.92. 
+
+```{r trend vs st, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# compare cbc linear trend and cbc st model 
+scaled_cbc_std <- read.csv("cbc_scaled_stand_mod.csv")
+scaled_idxs <- left_join(scaled_idxs, scaled_cbc_std)
+
+# plot scaled st cbc and trend cbc time series together
+scaled_idxs %>% drop_na() %>% 
+  filter(strat_name %in% sample(unique(scaled_idxs$strat_name), 20)) %>% 
+  ggplot() +
+  geom_line(aes(x=r_year, y=sc_fit_cbc), color="darkred") + 
+  geom_line(aes(x=r_year, y=sc_trend_cbc), color="darkblue") + 
+  facet_wrap(~strat_name, scales="free") +
+  labs(x="year", y="scaled spatiotemporal (red) and standard (blue) model CBC index")
+cor(scaled_idxs$sc_fit_cbc, scaled_idxs$sc_trend_cbc, use="complete.obs")
+```
+
+## 7. Posterior samples
+
+Thus far, we have been working with summaries of posterior predictions generated by `R-INLA` during model computation. In some cases we might wish to work with a complete sample of the posteriors for computing unplanned combinations of the linear predictor. Posterior samples are generated after model computation using the `inla.posterior.sample()` function, which we have wrapped in the `get_prediction_samples()` function, called below. In this case we are getting full posterior samples (n=1000) for the predicted abundance indices for each stratum per year. The function extracts the samples and formats them as a `tidyr` tibble in long form. We then take the samples, select samples for the strata in Pennsylvania, and plot them as time series using the `stat_lineribbon()` function from `tidybayes` package.
+
+```{r posterior samples, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# get posterior sample of abundance indices for cbc
+samps1 <- get_prediction_samples(mod_obj=res2, 
+                                   post_samp_size=1000,
+                                   pred_idx=pred_idx2,
+                                   pred_data=cbc3,
+                                   pred_id_cols=c("strat_name", "r_year"),
+                                   out_form="tidy_tibble")
+
+# plot cbc trajectories for strata in PA
+samps2 <- samps1 %>% filter(grepl('PA', strat_name))
+ggp3 <- samps2 %>% ggplot(aes(x=r_year, y=index)) +
+  stat_lineribbon(.width=c(0.5, 0.8, 0.95), lwd=0.8) + 
+  scale_fill_brewer() +
+  labs(x="year", y="predicted CBC abundance index") +
+  facet_wrap(~strat_name, scale="free") + theme_bw(); ggp3
+```
+
+## 8. Aggregate trajectories
+
+The posterior samples for the predictions can be used to scale the abundance indices from the stratum level up to coarser levels, such as states, provinces, BCRs, or countries (Sauer and Link 2011). Aggregated relative abundance trajectories are generated, for example, at the BCR level by summing area (`A` is stratum area) and proportion (`z` is proportion of counts in a stratum with wren detections) weighted annual abundance indices for all strata within a given BCR. Below, we do this using the posterior sample generated above and plot the aggregate trajectories for a sample of BCRs.
+
+```{r aggregate, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# get A and z and sum per bcr
+As <- map2 %>% st_drop_geometry()
+zs <-  cbc2 %>% distinct(strat_name, strat_z) %>% right_join(As)
+samps3 <- zs %>% 
+  mutate(strat_Az=strat_A*strat_z) %>% 
+  right_join(samps1) %>% 
+  mutate(country=str_split(strat_name, "-", simplify=TRUE)[,1],
+         state=str_split(strat_name, "-", simplify=TRUE)[,2],
+         bcr=str_split(strat_name, "-", simplify=TRUE)[,3],
+         strat_nAz=strat_Az*index) %>% 
+  group_by(bcr, r_year, .draw) %>% 
+  summarise(aggregate_N=sum(strat_nAz), aggregate_A=sum(strat_A)) %>% ungroup()
+
+# bcr plot
+samps3 %>% filter(grepl('22|23|24|25|27|28|29|13|14', bcr)) %>% 
+  ggplot(aes(x=r_year, y=aggregate_N/aggregate_A)) +
+      stat_lineribbon(.width=c(0.5, 0.8, 0.95), lwd=0.8) + 
+      scale_fill_brewer() +
+  labs(x="year", y="aggregated CBC abundance index / BCR area") +
+      facet_wrap(~bcr, scale="free") + theme_bw()
+```
+
+## 9. Generating trends from trajectories
+
+With aggregate abundance indices computed, we can turn to producing trends for Carolina Wren at the BCR level. Trends are commonly calculated in two ways. One way, described in Sauer and Link (2011), calculates an annual percent change between two time points in the trajectory, a ratio approach. A second way calculates an annual percent change from a Poisson regression of all the time points in a trajectory, ignoring any intervening non-linearity in the time series, a regression approach (Rosenberg et al. 2017). Below we demonstrate the regression approach, showing trend estimation and maps of the resulting trends. Along with trends, we also map an uncertainty interval for the trends, defined as the upper minus lower credible limit for each trend estimate. We make these maps using estimates from both the spatiotemporal CBC model and the standard CBC model described by Soykan et al. (2016).
+
+```{r agg trends, eval=TRUE, cache=TRUE, fig.align='center', fig.pos='t'}
+# get spatiotemporal regression trends
+cbc_bcr_reg_trends <- samps3 %>% group_by(bcr, .draw) %>% 
+  do(mod = glm(round(aggregate_N, 0) ~ r_year, data = ., family="poisson")) %>%
+  mutate(slope = summary(mod)$coeff[2]) %>%
+  select(-mod) %>% ungroup() %>% group_by(bcr) %>% 
+  summarise(mean_trend=(exp(mean(slope))-1)*100, 
+            lcl_trend=(exp(quantile(slope, probs=0.025))-1)*100, 
+            ucl_trend=(exp(quantile(slope, probs=0.975))-1)*100) %>% 
+  mutate(ci_range=ucl_trend-lcl_trend)
+
+# make map of bcr regression trends
+map3 <- load_map(stratify_by="bcr") %>% rename_all(tolower) %>% 
+  rename(bcr=st_12, strat_A=area_sq_km) %>%
+  mutate(bcr=gsub("BCR","", bcr)) %>% 
+  filter(bcr %in% cbc_bcr_reg_trends$bcr) %>% 
+  right_join(cbc_bcr_reg_trends) 
+
+# also get std model regression trends
+map4 <- read.csv("std_cbc_bcr_trends.csv") %>% 
+  mutate(bcr=as.character(bcr)) %>% 
+  mutate(ci_std_range=ucl_std_trend-lcl_std_trend) %>% 
+  left_join(map3, by="bcr") %>% st_as_sf()
+
+# map all trends together
+tr1 <- ggplot() + geom_sf(data=map4, aes(fill=mean_trend)) + 
+  scale_fill_distiller("space-time\ntrend (%/yr)", 
+                       palette="Spectral", limits=c(0, 12)) + theme_bw()
+tr2 <- ggplot() + geom_sf(data=map4, aes(fill=mean_std_trend)) + 
+  scale_fill_distiller("standard\ntrend (%/yr)", palette="Spectral", 
+                       limits=c(0, 12)) + theme_bw()
+r1 <- ggplot() + geom_sf(data=map4, aes(fill=ci_range)) + 
+  scale_fill_distiller("space-time\ninterval (%/yr)", palette="Spectral", 
+                       limits=c(0, 9)) + theme_bw()
+r2 <- ggplot() + geom_sf(data=map4, aes(fill=ci_std_range)) + 
+  scale_fill_distiller("standard\ninterval (%/yr)", 
+                       palette="Spectral", limits=c(0, 9)) + theme_bw()
+plot_grid(tr1, tr2, r1, r2)
+```
+
+The maps show two qualitative patterns. First, we see that the trends from the spatiotemporal model (top left) have a compressed range compared to those from the standard method (top right). This compression occurs at the range edges where the species is relative rare and estimates are shrunk toward the neighborhood mean. The bottom two maps show that the sizes of credible intervals are also smaller at range edges, as there is spatial sharing of information in the spatiotemporal model. Together these two patterns demonstrate how shrinkage and information sharing have the potential to reduce the effects of sampling variation at range edges where a species is much less common and sparse data could yield more extreme and uncertain trend estimates.
+
+## 10. Possible future directions
+
+Until recently the omnibus model used to estimate trajectories for the BBS and CBC programs was that described by Sauer and Link (2011), which described trajectories using log-normally distributed variation around a log-linear abundance trend, and modeled aerial units as spatially independent. This model has served the science and conservation community well. Recently, there has been considerable development work on other models that incorporate different types of temporal and spatial structure. 
+
+Smith and Edwards (2021), Link et al. (2017, 2020), and others have focused on more flexible temporal smoothers, including generalized additive and first-difference time series models. This work has demonstrated that incorporating more flexible temporal terms is leading to better predictive ability of models. This is in part due to shrinkage of temporal parameter estimates toward others that are adjacent in time. 
+
+Similarly, Bled et al. (2013), Michel et al. (2016), and  Meehan et al. (2019) and others have explored adding spatially structured model terms to models. This work has also demonstrated advantages related to improved prediction at range edges, where sparse data and sampling variation potentially lead to biased predictions and wide credible intervals. Like temporal structure, the potential benefits of spatial structure also include shrinkage of estimates toward those adjacent in space.
+
+Recent work has explored the possibility of fitting data with a small set of omnibus models, and using cross-validation methods to choose a best model for each of hundreds of species. Cross validation can be a challenge in this context due to the number of species and the computing demands of MCMC software that is typically used for such analysis. Meehan et al. (2019) explored use of `R-INLA` for Bayesian analysis of CBC models, finding that computing times were shortened by at least two orders of magnitude.
+
+The approach outlined in this vignette might be considered a "Franken Methode", that employs temporal and spatial terms with flexible first-order structure, and thus shrinkage to neigboring values, that can be computed relatively quickly, facilitating comparisons of small sets of candidate models using cross validation. 
+
+## 11. More information on modeling with `R-INLA`
+
+Below are some `R-INLA` formulas that can be used to compute some of the other standard and non-standard BBS and CBC models. Models can be compared using WAIC and BPIC metrics described above. Keep in mind that model comparison using various information criteria only considers how well a single model predicts a single dataset. Despite small differences in predictive ability, relative abundance trajectories and trends, the outputs that most people care about, can be practically identical (Link et al. 2020). A holistic approach to model selection should consider multiple factors, both principled and practical.
+
+Detailed information on analyzing a wide range of statistical models with `R-INLA` can be found in texts by Blangiardo and Camaletti (2015), Kranski et al. (2018), Moraga (2019) and Gomez-Rubio (2021).
+
+```{r std models, eval=FALSE, cache=TRUE, fig.align='center', fig.pos='t'}
+# versions of BBS models in INLA
+
+# bbs fixed intercept, fixed log-linear plus random year
+form <- count ~ 1 + firstyr + factor(strat_idx1)*year_cent +
+  f(obser_route_idx1, model="iid", constr=TRUE) +
+  f(year_idx1, model="iid", # year random effect per stratum
+    group=strat_idx2, control.group=list(model="iid"))
+
+# bbs random intercept, random log-linear plus random year
+form <- count ~ 1 + firstyr + year_cent +
+  f(obser_route_idx1, model="iid", constr=TRUE) +
+  f(strat_idx1, model="iid", constr=TRUE) +
+  f(strat_idx2, year_cent, model="iid", constr=TRUE) + # deviations from fixed year_cent
+  f(year_idx1, model="iid", group=strat_idx3, control.group=list(model="iid"))
+
+# bbs random intercept, random first order year
+form <- count ~ 1 + firstyr + 
+  f(obser_route_idx1, model="iid", constr=TRUE) + 
+  f(strat_idx1, model="iid", constr=TRUE) + # intercept per stratum
+  f(year_idx1, model="rw1", constr=TRUE, # rw (or use 'ar1') year effect per stratum
+    group=strat_idx2, control.group=list(model="iid")) 
+
+# choose a bbs formula and try it out
+test <- inla(form, data=bbs3,
+            family = "nbinomial", 
+            control.predictor=list(compute=TRUE, link=1),
+            control.compute=list(config=TRUE, waic=TRUE, cpo=TRUE,
+                                 control.gcpo=list(enable=TRUE)),
+            verbose=TRUE, inla.mode="experimental",
+            control.inla = list(strategy = 'adaptive', int.strategy = 'eb'))
+
+# view diagnostics
+dp9 <- ggplot(data.frame(x=test$cpo$pit[-pred_idx1])) +
+  geom_histogram(aes(x=x), col="white") + theme_bw()
+dp10 <- ggplot(data.frame(predicted=test$summary.fitted.values$mean, 
+       observed=bbs3$count), aes(x=observed, y=predicted)) + 
+  geom_point() + geom_abline(col="darkblue") + theme_bw()
+plot_grid(dp9, dp10)
+cor(test$summary.fitted.values$mean, bbs3$count, use="complete.obs")
+
+# model scores
+get_bpic(test, pred_idx1)$`-2*sum(log(cpo_vec), na.rm=TRUE)`
+bpic1$`-2*sum(log(cpo_vec), na.rm=TRUE)`
+test$waic$waic
+waic1
+
+# cbc random intercept, random log-linear plus random year
+form <- count ~ 1 + log_hrs + year_cent +
+  f(circ_idx1, model="iid", constr=TRUE) +
+  f(strat_idx1, log_hrs, model="iid", constr=TRUE) +
+  f(strat_idx2, model="iid", constr=TRUE) +
+  f(strat_idx3, year_cent, model="iid", constr=TRUE) +
+  f(year_idx1, model="iid", constr=TRUE, group=strat_idx4,
+    control.group=list(model="iid"))
+```
+
+## 12. Citations
+
+Besag, J., York, J. and Mollié, A., 1991. Bayesian image restoration, with two applications in spatial statistics. Annals of the institute of statistical mathematics, 43(1), pp.1-20.
+
+Blangiardo, M. and Cameletti, M., 2015. Spatial and spatio-temporal Bayesian models with R-INLA. John Wiley & Sons.
+
+Bled, F., Sauer, J., Pardieck, K., Doherty, P. and Royle, J.A., 2013. Modeling trends from North American Breeding Bird Survey data: A spatially explicit approach. PLoS One, 8(12), p.e81867.
+
+Czado, C., Gneiting, T. and Held, L., 2009. Predictive model assessment for count data. Biometrics, 65(4), pp.1254-1261.
+
+Gómez-Rubio, V., 2020. Bayesian inference with INLA. CRC Press.
+
+Held, L., Schrödle, B. and Rue, H., 2010. Posterior and cross-validatory predictive checks: a comparison of MCMC and INLA. In Statistical modelling and regression structures (pp. 91-110). Physica-Verlag HD.
+
+Knorr-Held, L., 2000. Bayesian modelling of inseparable space‐time variation in disease risk. Statistics in medicine, 19(17-18), pp.2555-2567.
+
+Krainski, E., Gómez-Rubio, V., Bakka, H., Lenzi, A., Castro-Camilo, D., Simpson, D., Lindgren, F. and Rue, H., 2018. Advanced spatial modeling with stochastic partial differential equations using R and INLA. Chapman and Hall/CRC.
+
+Link, W.A. and Sauer, J.R., 2002. A hierarchical analysis of population change with application to Cerulean Warblers. Ecology, 83(10), pp.2832-2840.
+
+Link, W.A., Sauer, J.R. and Niven, D.K., 2006. A hierarchical model for regional analysis of population change using Christmas Bird Count data, with application to the American Black Duck. The Condor, 108(1), pp.13-24.
+
+Link, W.A. and Sauer, J.R., 2007. Seasonal components of avian population change: Joint analysis of two large-scale monitoring programs. Ecology, 88(1), pp.49-55.
+
+Link, W.A., Sauer, J.R. and Niven, D.K., 2017. Model selection for the North American Breeding Bird Survey: A comparison of methods. The Condor: Ornithological Applications, 119(3), pp.546-556.
+
+Link, W.A., Sauer, J.R. and Niven, D.K., 2020. Model selection for the North American Breeding Bird Survey. Ecological Applications, 30(6), p.e02137.
+
+Meehan, T.D., Michel, N.L. and Rue, H., 2019. Spatial modeling of Audubon Christmas Bird Counts reveals fine‐scale patterns and drivers of relative abundance trends. Ecosphere, 10(4), p.e02707.
+
+Michel, N.L., Smith, A.C., Clark, R.G., Morrissey, C.A. and Hobson, K.A., 2016. Differences in spatial synchrony and interspecific concordance inform guild‐level population trends for aerial insectivorous birds. Ecography, 39(8), pp.774-786.
+
+Moraga, P., 2019. Geospatial health data: Modeling and visualization with R-INLA and shiny. CRC Press.
+
+R Core Team, 2021. R: a language and environment for statistical computing. R Foundation for Statistical Computing. Published 2018.
+
+Riebler, A., Sørbye, S.H., Simpson, D. and Rue, H., 2016. An intuitive Bayesian spatial model for disease mapping that accounts for scaling. Statistical methods in medical research, 25(4), pp.1145-1165.
+
+Rue, H., Riebler, A., Sørbye, S.H., Illian, J.B., Simpson, D.P. and Lindgren, F.K., 2017. Bayesian Computing with INLA: A Review. Annual Review of Statistics and Its Application, 4(1), pp.395-421.
+
+Sauer, J.R., Fallon, J.E. and Johnson, R., 2003. Use of North American Breeding Bird Survey data to estimate population change for bird conservation regions. The Journal of wildlife management, pp.372-389.
+
+Sauer, J.R. and Link, W.A., 2011. Analysis of the North American breeding bird survey using hierarchical models. The Auk, 128(1), pp.87-98.
+
+Simpson, D., Rue, H., Riebler, A., Martins, T.G. and Sørbye, S.H., 2017. Penalising model component complexity: A principled, practical approach to constructing priors. Statistical science, 32(1), pp.1-28.
+
+Smith, A.C. and Edwards, B.P., 2021. North American Breeding Bird Survey status and trend estimates to inform a wide range of conservation needs, using a flexible Bayesian hierarchical generalized additive model. The Condor, 123(1), p.duaa065.
+
+Soykan, C.U., Sauer, J., Schuetz, J.G., LeBaron, G.S., Dale, K. and Langham, G.M., 2016. Population trends for North American winter birds based on hierarchical models. Ecosphere, 7(5), p.e01351.
