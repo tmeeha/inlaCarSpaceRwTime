@@ -1,0 +1,16 @@
+ggplot2
+cowplot
+bbsBayes
+tidybayes
+coda
+spData
+sf
+spdep
+Matrix
+sp
+INLA
+brinla
+inlatools
+tidyr
+dplyr
+stringr
