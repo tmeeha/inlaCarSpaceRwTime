@@ -1,6 +1,5 @@
 ---
-title: A spatiotemporal interaction model for analysis of long-term, 
-large-extent, wildlife abundance data
+title: A spatiotemporal interaction model for analysis of long-term, large-extent, wildlife abundance data
 author: "Timothy D. Meehan"
 date: "`r Sys.Date()`"
 output:

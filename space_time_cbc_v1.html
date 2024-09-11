@@ -1503,17 +1503,16 @@ temporal effects in a more flexible manner (Link et al. 2017, Smith and
 Edwards 2020) relative to the standard model originally described in
 Link and Sauer (2002). An additional motivation was to demonstrate
 implementing BBS and CBC models with integrated, nested, Laplace
-approximation (INLA) using the <code>R-INLA</code> package (Rue et
-al. 2017) for <code>R</code> statistical computing software (R Core
-Team). Analysis of Bayesian spatiotemporal models using
-<code>R-INLA</code> is attractive because tools for building
-spatiotemporal models are well developed, and computing times are a
-small fraction of those needed for MCMC analysis. Reduced computing
-times is not just an issue of convenience, as it facilitates running
-more models and multimodel selection (Link et al. 2017, 2020). Also,
-cross-validation based model selection criteria already used for
-selection of BBS models are easily derivable from INLA output (Held et
-al. 2010).</p>
+approximation (INLA) using the <code>R-INLA</code> package (Rue et al. 
+2017) for <code>R</code> statistical computing software (R Core Team).
+Analysis of Bayesian spatiotemporal models using <code>R-INLA</code> is
+attractive because tools for building spatiotemporal models are well
+developed, and computing times are a small fraction of those needed for
+MCMC analysis. Reduced computing times is not just an issue of
+convenience, as it facilitates running more models and multimodel
+selection (Link et al. 2017, 2020). Also, cross-validation based model
+selection criteria already used for selection of BBS models are easily
+derivable from INLA output (Held et al. 2010).</p>
 <p>In this document, we demonstrate model implementation using counts of
 Carolina Wren (<em>Thryothorus ludovicianus</em>) from both the BBS and
 the CBC. The species was chosen because it is a year-round resident of
@@ -1547,24 +1546,20 @@ ranges from 3 to 95 and averages 22. From a practical perspective,
 analytical strata are currently the standard spatial unit of analysis
 (Sauer and Link 2011, Soykan et al. 2016), so using them facilitates
 methodological comparisons. The methods here could also be applied to
-smaller, uniform grids, like those used for finer-grained analyses
+smaller, uniform grids, like those used for finer- grained analyses
 demonstrated by Bled et al. (2013) and Meehan et al. (2019). Using finer
 grids facilitates fine-scaled analysis of drivers of relative abundance
 trajectories, but also has tradeoffs, and they are not employed
 here.</p>
-<p>The approach described here uses a spatiotemporal model developed and
-widely used in epidemiology (Knorr-Held 2000). The spatiotemporal
-component has exchangeable and ICAR-structured (intrinsic conditional
-autoregressive) spatial main effects, and exchangeable and
-RW1-structured (first-order random walk) temporal main effects. The
-model also includes a type IV space-time interaction where ICAR
-structure evolves over time according to an RW1. The mathematics of the
-model are described by Knorr-Held (2000) and implementation in
-<code>R-INLA</code> is described by Blangiardo and Cameletti (2015).
-Besides the spatiotemporal components, the linear predictor also
-includes fixed and random terms that are associated with nuisance
-variables related to the counting process. These terms vary across the
-BBS and CBC and are described below.</p>
+<p>The approach described here uses a spatiotemporal model where the
+spatial component has exchangeable and ICAR-structured (intrinsic
+conditional autoregressive) effects of strata and the temporal component
+has RW1-structure (first-order random walk). The model incoporates a
+space-time interaction where the spatial structure evolves over time
+according to an RW1. Besides the spatiotemporal components, the linear
+predictor also includes fixed and random terms that are associated with
+nuisance variables related to the counting process. These terms vary
+across the BBS and CBC and are described below.</p>
 <p>In the following sections we walk through the nearly complete process
 of loading data, preparing data for analysis in <code>R-INLA</code>,
 defining and computing models, viewing model output and diagnostics,
@@ -1582,58 +1577,6 @@ data munging; <code>R-INLA</code>, <code>brinla</code>,
 <code>ggplot2</code> and <code>cowplot</code> for creating figures. We
 also set some options and create some helper functions for extracting
 model scores and predictions from <code>R-INLA</code> objects.</p>
-<pre class="r"><code>setwd(getwd())
-
-# libraries
-library(ggplot2); library(cowplot); library(bbsBayes); library(tidybayes)
-library(coda); library(spdep); library(brinla); library(inlatools); 
-library(sf); library(INLA); library(tidyr); library(stringr); library(dplyr)
-
-# options
-inla.setOption(inla.mode=&quot;experimental&quot;)
-options(scipen=9999999)
-options(max.print=99999)
-options(stringsAsFactors=FALSE)
-
-# helper for getting model scores
-get_bpic &lt;- function(mod=res1, pred_idx=pred_idx1){
-  require(INLA)
-  cpo_vec &lt;- mod$gcpo$gcpo[-pred_idx]
-  nas &lt;- which(is.na(cpo_vec))
-  if(any(is.na(cpo_vec))) 
-    warning(paste(&quot;Some CPO values are NA. BPIC may not be&quot;, 
-                  &quot;reliable for model comparison.&quot;)) 
-  out1 &lt;- as.numeric(-2*sum(log(cpo_vec), na.rm=TRUE))
-  out2 &lt;- as.numeric(mean(log(cpo_vec), na.rm=TRUE))
-  out3 &lt;- as.integer(nas)
-  out &lt;- list(`-2*sum(log(cpo_vec), na.rm=TRUE)`=out1,
-              `mean(log(cpo_vec), na.rm=TRUE)`=out2,
-              `number_na`=length(out3),
-              `na_indices`=out3)
-  return(out)
-}
-
-# helper for getting model predictions
-get_prediction_samples &lt;- function(mod_obj=res1, post_samp_size=1000,
-                                   pred_idx=pred_idx1, pred_data=bbs3,
-                                   pred_id_cols=c(&quot;strat_name&quot;, &quot;r_year&quot;),
-                                   out_form=c(&quot;mcmc_list&quot;, &quot;tidy_tibble&quot;)
-                                   ){
-  require(coda); require(tidyr); library(tidybayes); require(INLA); 
-  require(dplyr)
-  s1 &lt;- INLA::inla.posterior.sample(post_samp_size, mod_obj)
-  s2 &lt;- INLA::inla.posterior.sample.eval(&quot;Predictor&quot;, s1)[pred_idx,] 
-  s2 &lt;- t(exp(s2))
-  ids1 &lt;- pred_data %&gt;% dplyr::slice(pred_idx) %&gt;% 
-    dplyr::select(pred_id_cols)  
-  colnames(s2) &lt;- paste0(&quot;index[&quot;, paste(ids1$strat_name, 
-                                                ids1$r_year, sep=&quot;,&quot;), &quot;]&quot;)
-  s3 &lt;- as.mcmc.list(mcmc(s2))
-  if(out_form==&quot;tidy_tibble&quot;){
-    s3 &lt;- spread_draws(s3, index[strat_name, r_year])
-  }
-  return(s3)
-}</code></pre>
 </div>
 <div id="spatiotemporal-analysis-for-bbs-data" class="section level2">
 <h2>3. Spatiotemporal analysis for BBS data</h2>
@@ -1723,48 +1666,35 @@ prec_prior &lt;- list(prec = list(prior = &quot;pc.prec&quot;, param = c(1, 0.01
 bym_prior &lt;- list(prec = list(prior = &quot;pc.prec&quot;, param = c(1, 0.01)), 
                   phi = list(prior = &quot;pc&quot;, param = c(0.5, 0.5)))
 
-# # make formula for bbs st model
-# form &lt;- count ~ 1 + firstyr + 
-#   f(obser_route_idx1, model=&quot;iid&quot;, constr=TRUE, hyper=prec_prior) +
-#   f(year_idx1, model=&quot;iid&quot;, constr=TRUE, hyper=prec_prior) +
-#   f(year_idx2, model=&quot;rw1&quot;, constr=TRUE, scale.model=TRUE, hyper=prec_prior) + 
-#   f(strat_idx1, model=&quot;bym2&quot;, graph=g1, constr=TRUE, scale.model=TRUE, hyper=bym_prior) +
-#   f(strat_idx2, model=&quot;besag&quot;, graph=g1, constr=TRUE, scale.model=TRUE,
-#     group=year_idx3, control.group=list(model=&quot;rw1&quot;, hyper=prec_prior)) 
-
 # make formula for bbs st model
 form &lt;- count ~ 1 + firstyr + 
   f(obser_route_idx1, model=&quot;iid&quot;, hyper=prec_prior) +
   f(strat_idx1, model=&quot;bym2&quot;, graph=g1, scale.model=TRUE, hyper=bym_prior,
     group=year_idx1, control.group=list(model=&quot;rw1&quot;, hyper=prec_prior)) </code></pre>
-<p>The second and third random effects are the zero-centered
-exchangeable (<code>constr=TRUE</code>, <code>model=&quot;iid&quot;</code>) and
-RW1-structured (<code>model=&quot;rw1&quot;</code>) temporal main effects indexed
-over 1 to 50 years (<code>year_idx1</code>, <code>year_idx2</code>). The
-fourth random term specifies the Besag-York-Mollie model
+<p>The second random effects is the space-time interaction term, a
+zero-centered, spatially-structured (<code>model=&quot;bym2&quot;</code>), stratum
+effect (<code>strat_idx2</code>) that evolves over time
+(<code>year_idx3</code>) as an RW1.</p>
+<p>The spatial component is the Besag-York-Mollie model
 (<code>model=&quot;bym2&quot;</code>, BYM, Besag et al. 1991) modified by Riebler
-et al. (2016), which comprises both a zero-centered exchangeable and
+et al. (2016), which comprises both a zero- centered exchangeable and
 ICAR-structured spatial main effect indexed over 1 to 85 strata
-(<code>strat_idx1</code>). The fifth random effect is the space-time
-interaction term, a zero-centered, ICAR-structured
-(<code>model=&quot;besag&quot;</code>), spatial effect (<code>strat_idx2</code>)
-that evolves over time (<code>year_idx3</code>) as an RW1. The
-<code>R-INLA</code> graph object (<code>graph=g1</code>) describes the
-spatial relationships between the strata. The priors used for the
-standard deviation of random effects are penalized-complexity (PC)
-priors, set such that the probability of a random effect exceeding 1 SD
-is 0.01 (Simpson et al. 2017). The prior for the proportion variance
-explained by the spatially structured effect in the BYM model is set
-such that the probability of a proportion exceeding 0.5 is 0.5 (Riebler
-et al. 2016). Priors for fixed effects are vague normal priors with mean
-of 0 and precision of 0 for the intercept and 0.001 otherwise. Note that
-predicted abundance indices from this model will be generated assuming
-an experienced observer and ignoring the zero-centered observer-route
-effect. This was specified above when generating the prediction rows in
-the dataset using <code>firstyr=0</code> and
-<code>obser_route_idx1=NA</code>. Adding variance components to rescale
-predicted abundance indices (Sauer and Link 2011) is not done here given
-their relative interpretation.</p>
+(<code>strat_idx1</code>). The <code>R-INLA</code> graph object
+(<code>graph=g1</code>) describes the spatial relationships between the
+strata. The priors used for the standard deviation of random effects are
+penalized-complexity (PC) priors, set such that the probability of a
+random effect exceeding 1 SD is 0.01 (Simpson et al. 2017). The prior
+for the proportion variance explained by the spatially structured effect
+in the BYM model is set such that the probability of a proportion
+exceeding 0.5 is 0.5 (Riebler et al. 2016). Priors for fixed effects are
+vague normal priors with mean of 0 and precision of 0 for the intercept
+and 0.001 otherwise. Note that predicted abundance indices from this
+model will be generated assuming an experienced observer and ignoring
+the zero-centered observer-route effect. This was specified above when
+generating the prediction rows in the dataset using
+<code>firstyr=0</code> and <code>obser_route_idx1=NA</code>. Adding
+variance components to rescale predicted abundance indices (Sauer and
+Link 2011) is not done here given their relative interpretation.</p>
 </div>
 <div id="run-the-bbs-spatiotemporal-model" class="section level3">
 <h3>3.4 Run the BBS spatiotemporal model</h3>
@@ -1938,48 +1868,37 @@ g2 &lt;- inla.read.graph(filename = &quot;map.adj&quot;)</code></pre>
 <div id="define-and-run-the-cbc-spatiotemporal-model" class="section level3">
 <h3>4.2 Define and run the CBC spatiotemporal model</h3>
 <p>The model for the CBC data is similar to that for BBS data. Like last
-time, we specify a global intercept, the temporal and spatial main
-effects, and the space-time interaction term. The zero-centered,
-exchangeable random intercept per CBC count circle is analogous to the
-observer-route effect in the BBS model. Finally, CBC is different from
-BBS in that the effort expended on a count can vary enormously across
-space and time. Thus we need to control for varying effort, using a
-measurement of effort called party hours. In past work, we have had good
-results accounting for effort by adding the natural log of effort to the
-linear predictor (Meehan et al. 2019). The log of party hours regressed
-against the log of expected count leads to a flexible power-law
-effort-correction function that can accommodate linear and accelerating
-and decelerating nonlinear relationships between the two measures. It is
-not as flexible as the two parameter power function that is often used
-for CBC data (Link et al. 2006, Soykan et al. 2016), but we have found
-that the second power law parameter is seldom needed (parameter estimate
-<span class="math inline">\(p\)</span> is seldom different from 0), and
-including it in the model makes model estimation less stable. Previous
-work has also shown that there is considerable spatial structure in the
-effort-correction coefficient, where power curves are flatter where
-species are less abundant and steeper where species are more abundant,
-which makes sense from a sampling perspective. So here we model the
-effort-correction function as a global fixed effect paired with a
-spatially varying (ICAR-structured), zero-centered deviation. Predicted
-abundance indices ignore the zero-centered circle effect, and assume an
-average number of party hours, as defined in the prediction rows added
-to the dataset (<code>log_hrs=mean(cbc2$log_hrs)</code>,
-<code>circ_idx1=NA</code>). Priors for all terms were specified as
-described above for the BBS model. After the model is defined, we run
-the <code>inla()</code> command as before. Again, computing time for
-this spatiotemporal model was under 10 minutes.</p>
-<pre class="r"><code># # make cbc st formula
-# form &lt;- count ~ 1 + log_hrs +
-#   f(circ_idx1, model=&quot;iid&quot;, constr=TRUE, hyper=prec_prior) +
-#   f(strat_idx1, log_hrs, model=&quot;besag&quot;, graph=g2, constr=TRUE, scale.model=TRUE, 
-#     hyper=prec_prior) +
-#   f(year_idx1, model=&quot;iid&quot;, constr=TRUE, hyper=prec_prior) +
-#   f(year_idx2, model=&quot;rw1&quot;, constr=TRUE, scale.model=TRUE, hyper=prec_prior) +
-#   f(strat_idx2, model=&quot;bym2&quot;, graph=g2, constr=TRUE, scale.model=TRUE, hyper=bym_prior) +
-#   f(strat_idx2, model=&quot;bym2&quot;, graph=g2, constr=TRUE, scale.model=TRUE, hyper=bym_prior,
-#     group=year_idx1, control.group=list(model=&quot;rw1&quot;, hyper=prec_prior)) 
-
-# make cbc st formula
+time, we specify a global intercept and the space-time interaction term.
+The zero- centered, exchangeable random intercept per CBC count circle
+is analogous to the observer-route effect in the BBS model. Finally, CBC
+is different from BBS in that the effort expended on a count can vary
+enormously across space and time. Thus we need to control for varying
+effort, using a measurement of effort called party hours. In past work,
+we have had good results accounting for effort by adding the natural log
+of effort to the linear predictor (Meehan et al. 2019). The log of party
+hours regressed against the log of expected count leads to a flexible
+power-law effort-correction function that can accommodate linear and
+accelerating and decelerating nonlinear relationships between the two
+measures. It is not as flexible as the two parameter power function that
+is often used for CBC data (Link et al. 2006, Soykan et al. 2016), but
+we have found that the second power law parameter is seldom needed
+(parameter estimate <span class="math inline">\(p\)</span> is seldom
+different from 0), and including it in the model makes model estimation
+less stable. Previous work has also shown that there is considerable
+spatial structure in the effort-correction coefficient, where power
+curves are flatter where species are less abundant and steeper where
+species are more abundant, which makes sense from a sampling
+perspective. So here we model the effort- correction function as a
+global fixed effect paired with a spatially varying (ICAR-structured),
+zero-centered deviation. Predicted abundance indices ignore the
+zero-centered circle effect, and assume an average number of party
+hours, as defined in the prediction rows added to the dataset
+(<code>log_hrs=mean(cbc2$log_hrs)</code>, <code>circ_idx1=NA</code>).
+Priors for all terms were specified as described above for the BBS
+model. After the model is defined, we run the <code>inla()</code>
+command as before. Again, computing time for this spatiotemporal model
+was under 10 minutes.</p>
+<pre class="r"><code># make cbc st formula
 form &lt;- count ~ 1 + log_hrs +
   f(circ_idx1, model=&quot;iid&quot;, hyper=prec_prior) +
   f(strat_idx1, log_hrs, model=&quot;besag&quot;, graph=g2, scale.model=TRUE, 
@@ -2317,7 +2236,7 @@ time.</p>
 al. (2019) and others have explored adding spatially structured model
 terms to models. This work has also demonstrated advantages related to
 improved prediction at range edges, where sparse data and sampling
-variation potentially lead to biased predictions and wide credible
+variation potentially lead to biased redictions and wide credible
 intervals. Like temporal structure, the potential benefits of spatial
 structure also include shrinkage of estimates toward those adjacent in
 space.</p>
